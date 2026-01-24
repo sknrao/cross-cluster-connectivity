@@ -535,7 +535,6 @@ Think of it this way:
 
 Kubernetes doesn't know about, manage, or route to MacVLAN IPs. They're as external to Kubernetes as any other physical network device.
 
-Does this clarify the distinction between Kubernetes-managed and MacVLAN-managed IPs?
 ---
 
 ## The Scenario
