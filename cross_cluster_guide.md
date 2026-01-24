@@ -2654,17 +2654,565 @@ You are **designing a telecom underlay with Kubernetes as a control plane**.
 That’s the correct mental model.
 
 ---
+## CNI Plugin Hierarchy
 
-Next logical steps (when you’re ready):
-1️⃣ What happens when **UPF node dies** (real HA story)
-2️⃣ Multiple UPFs + SMF selection
-3️⃣ How OAI gNB behaves during N3 interruption
+### The Actual Architecture
 
-Say the word — you’re asking the *right* questions in the *right* order.
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Pod Creation                          │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────┐
+│                  Kubelet                                 │
+│  "I need to create network for this pod"                │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     │
+        ┌────────────┴────────────┐
+        │                         │
+        ▼                         ▼
+┌───────────────┐         ┌──────────────────┐
+│ PRIMARY CNI   │         │ Does pod have    │
+│ (Calico)      │         │ Multus annotation│
+│               │         │ ?                │
+│ ALWAYS called │         └────────┬─────────┘
+│ first         │                  │
+└───────┬───────┘                  │
+        │                          │
+        │ Creates eth0             │ YES → Multus invoked
+        │ (10.244.x.x)             │ NO  → Skip
+        │                          │
+        ▼                          ▼
+┌───────────────┐         ┌──────────────────┐
+│ eth0 ready    │         │ Multus CNI       │
+│               │         │ (meta-plugin)    │
+│ Pod has       │         │                  │
+│ Kubernetes IP │         │ Calls additional │
+│               │         │ CNI plugins      │
+└───────────────┘         └────────┬─────────┘
+                                   │
+                          ┌────────┴─────────┐
+                          │                  │
+                          ▼                  ▼
+                   ┌──────────────┐   ┌──────────────┐
+                   │ MacVLAN CNI  │   │ SRIOV CNI    │
+                   │              │   │              │
+                   │ Creates net1 │   │ Creates net2 │
+                   └──────────────┘   └──────────────┘
+```
 
+### Key Points
+
+**1. Primary CNI (Calico) is called DIRECTLY by Kubelet**
+```
+Kubelet → Calico CNI → eth0 created
+```
+
+**2. Multus is called SEPARATELY by Kubelet (after primary CNI)**
+```
+Kubelet → Multus CNI → MacVLAN CNI → net1 created
+                     → SRIOV CNI   → net2 created
+```
+
+**3. They run in SEQUENCE, not nested**
+```
+Step 1: Primary CNI runs → Creates eth0
+Step 2: Multus runs (if annotation present) → Creates additional interfaces
+```
 
 ---
 
+## CNI Configuration Files
+
+Let me show you the actual CNI configuration structure on a Kubernetes node:
+
+### Location: `/etc/cni/net.d/`
+
+```bash
+$ ls -la /etc/cni/net.d/
+total 24
+-rw-r--r-- 1 root root  617 Jan 10 10:00 00-multus.conf
+-rw-r--r-- 1 root root  292 Jan 10 09:55 10-calico.conflist
+-rw-r--r-- 1 root root  156 Jan 10 10:05 macvlan-conf.conf
+```
+
+### Primary CNI: `10-calico.conflist`
+
+```json
+{
+  "name": "k8s-pod-network",
+  "cniVersion": "0.3.1",
+  "plugins": [
+    {
+      "type": "calico",
+      "log_level": "info",
+      "datastore_type": "kubernetes",
+      "ipam": {
+        "type": "calico-ipam"
+      },
+      "policy": {
+        "type": "k8s"
+      },
+      "kubernetes": {
+        "kubeconfig": "/etc/cni/net.d/calico-kubeconfig"
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true}
+    }
+  ]
+}
+```
+
+**Kubelet reads this and calls Calico directly.**
+
+### Multus Configuration: `00-multus.conf`
+
+```json
+{
+  "name": "multus-cni-network",
+  "type": "multus",
+  "cniVersion": "0.3.1",
+  "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig",
+  "delegates": [
+    {
+      "cniVersion": "0.3.1",
+      "name": "k8s-pod-network",
+      "plugins": [
+        {
+          "type": "calico",
+          "log_level": "info",
+          "datastore_type": "kubernetes",
+          "ipam": {
+            "type": "calico-ipam"
+          },
+          "policy": {
+            "type": "k8s"
+          },
+          "kubernetes": {
+            "kubeconfig": "/etc/cni/net.d/calico-kubeconfig"
+          }
+        },
+        {
+          "type": "portmap",
+          "capabilities": {"portMappings": true}
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Notice:** The `delegates` section contains the **SAME** Calico configuration!
+
+### NetworkAttachmentDefinition: MacVLAN
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-conf
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "bridge",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.100.0/24"
+      }
+    }
+```
+
+**This is NOT a CNI config file - it's a Kubernetes CRD that Multus reads.**
+
+---
+
+## How It Actually Works
+
+### Without Multus (Standard Kubernetes)
+
+```
+┌─────────────────────────────────────────┐
+│  Kubelet CNI Plugin Invocation          │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+      ┌──────────────────────┐
+      │  /etc/cni/net.d/     │
+      │                      │
+      │  Reads configs in    │
+      │  lexicographic order │
+      └──────────┬───────────┘
+                 │
+                 ▼
+      ┌──────────────────────┐
+      │  10-calico.conflist  │ ← First file (alphabetically)
+      │                      │
+      │  Kubelet calls this  │
+      └──────────┬───────────┘
+                 │
+                 ▼
+      ┌──────────────────────┐
+      │   Calico CNI binary  │
+      │   /opt/cni/bin/      │
+      │   calico             │
+      └──────────┬───────────┘
+                 │
+                 ▼
+      ┌──────────────────────┐
+      │   eth0 created       │
+      │   10.244.1.5/24      │
+      └──────────────────────┘
+```
+
+### With Multus (Multi-Interface)
+
+```
+┌─────────────────────────────────────────┐
+│  Kubelet CNI Plugin Invocation          │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+      ┌──────────────────────┐
+      │  /etc/cni/net.d/     │
+      │                      │
+      │  Reads configs in    │
+      │  lexicographic order │
+      └──────────┬───────────┘
+                 │
+                 ▼
+      ┌──────────────────────┐
+      │  00-multus.conf      │ ← First file (00- prefix)
+      │                      │
+      │  Kubelet calls this  │
+      └──────────┬───────────┘
+                 │
+                 ▼
+      ┌──────────────────────────────────────┐
+      │   Multus CNI binary                  │
+      │   /opt/cni/bin/multus                │
+      │                                      │
+      │   Multus does TWO things:            │
+      │                                      │
+      │   1. Calls "delegate" (primary CNI)  │
+      │      → Calico                        │
+      │      → Creates eth0                  │
+      │                                      │
+      │   2. Checks pod annotations          │
+      │      k8s.v1.cni.cncf.io/networks     │
+      │                                      │
+      │      If annotation exists:           │
+      │      → Reads NetworkAttachment       │
+      │         Definitions                  │
+      │      → Calls additional CNI plugins  │
+      │         (MacVLAN, SRIOV, etc.)       │
+      └──────────┬───────────────────────────┘
+                 │
+        ┌────────┴────────┐
+        │                 │
+        ▼                 ▼
+┌───────────────┐  ┌──────────────────┐
+│ Calico CNI    │  │ MacVLAN CNI      │
+│               │  │                  │
+│ Creates eth0  │  │ Creates net1     │
+│ 10.244.1.5    │  │ 192.168.100.100  │
+└───────────────┘  └──────────────────┘
+```
+
+---
+
+## Detailed Call Sequence
+
+### Step 1: Kubelet Determines Which CNI to Call
+
+```bash
+# Kubelet looks in /etc/cni/net.d/
+# Picks the FIRST configuration file (alphabetically)
+
+$ ls /etc/cni/net.d/
+00-multus.conf        ← This one! (starts with 00)
+10-calico.conflist    ← Would be used if no multus
+```
+
+### Step 2: Multus is Invoked
+
+```bash
+# Kubelet executes
+/opt/cni/bin/multus < 00-multus.conf
+
+# Multus receives CNI ADD command with:
+# - Container ID
+# - Network namespace
+# - Pod name/namespace
+```
+
+### Step 3: Multus Calls Delegate (Primary CNI)
+
+```go
+// Inside Multus code (simplified)
+
+// Read the delegate configuration
+delegateConf := config.Delegates[0]  // Points to Calico
+
+// Call the delegate CNI plugin
+result, err := invoke.DelegateAdd(
+    context.TODO(),
+    delegateConf.Name,  // "calico"
+    delegateConf.Config,
+    containerID,
+    netns,
+)
+
+// Calico creates eth0 with IP 10.244.1.5
+```
+
+### Step 4: Multus Checks for Annotations
+
+```go
+// Get pod information
+pod := k8sClient.GetPod(namespace, podName)
+
+// Check for network annotation
+networksAnnotation := pod.Annotations["k8s.v1.cni.cncf.io/networks"]
+
+if networksAnnotation != "" {
+    // Parse annotation: "macvlan-conf, sriov-conf"
+    networks := parseNetworks(networksAnnotation)
+    
+    for _, network := range networks {
+        // Get NetworkAttachmentDefinition
+        nad := k8sClient.GetNetworkAttachmentDefinition(network)
+        
+        // Call the specified CNI plugin
+        result, err := invoke.DelegateAdd(
+            context.TODO(),
+            nad.Spec.Config.Type,  // "macvlan"
+            nad.Spec.Config,
+            containerID,
+            netns,
+        )
+        
+        // MacVLAN creates net1 with IP 192.168.100.100
+    }
+}
+```
+
+### Step 5: All Interfaces Created
+
+```bash
+# Final result inside pod
+$ ip addr
+
+1: lo: <LOOPBACK,UP>
+    inet 127.0.0.1/8
+
+2: eth0@if10: <BROADCAST,MULTICAST,UP>
+    inet 10.244.1.5/24
+    ↑ Created by Calico (via Multus delegate)
+
+3: net1@if5: <BROADCAST,MULTICAST,UP>
+    inet 192.168.100.100/24
+    ↑ Created by MacVLAN (via Multus additional networks)
+```
+
+---
+
+## Configuration File Naming Convention
+
+The `00-` prefix is crucial:
+
+```bash
+/etc/cni/net.d/
+├── 00-multus.conf         ← Loaded FIRST (Multus as wrapper)
+├── 10-calico.conflist     ← Referenced by Multus as delegate
+└── macvlan-conf.conf      ← Not used by Kubelet directly!
+                              Only used by Multus via NAD
+```
+
+**Without the `00-` prefix:**
+```bash
+/etc/cni/net.d/
+├── 10-calico.conflist     ← Loaded FIRST (no Multus)
+├── 20-multus.conf         ← IGNORED! (Calico already handled it)
+```
+
+In this case, Multus would never be called!
+
+---
+
+## Why This Design?
+
+### Multus is a "Meta-Plugin" or "Wrapper"
+
+Multus doesn't manage networks itself - it:
+1. **Delegates** primary network to another CNI (Calico, Flannel, etc.)
+2. **Orchestrates** additional network attachments
+
+### Benefits of This Architecture
+
+**1. Backward Compatibility**
+```
+Existing CNI plugins (Calico, Flannel) work unchanged
+No modification needed to primary CNI
+```
+
+**2. Single Entry Point**
+```
+Kubelet only calls ONE CNI plugin (Multus)
+Multus handles all the complexity
+```
+
+**3. Flexibility**
+```
+Primary CNI: Can be ANY CNI (Calico, Flannel, Cilium, etc.)
+Secondary CNIs: Can be ANY number of additional networks
+```
+
+**4. Clean Separation**
+```
+Primary network: Kubernetes management, Services, DNS
+Secondary networks: Workload-specific (N2, N3, storage, etc.)
+```
+
+---
+
+## Common Misconception vs Reality
+
+### ❌ Misconception
+
+```
+Kubelet
+  ↓
+Multus (manages everything)
+  ↓
+├─ Calico (creates eth0)
+├─ MacVLAN (creates net1)
+└─ SRIOV (creates net2)
+
+"Multus controls all CNI plugins"
+```
+
+### ✅ Reality
+
+```
+Kubelet
+  ↓
+Multus (orchestrator/wrapper)
+  ↓
+  ├─ Delegates to Calico (for eth0)
+  │   └─ Calico creates eth0
+  │
+  └─ Calls additional plugins (for net1, net2, etc.)
+      ├─ MacVLAN creates net1
+      └─ SRIOV creates net2
+
+"Multus delegates primary, adds secondary"
+```
+
+---
+
+## Verification Commands
+
+### Check CNI Configuration Order
+
+```bash
+# On Kubernetes node
+$ ls -la /etc/cni/net.d/
+-rw-r--r-- 1 root root  617 Jan 10 10:00 00-multus.conf
+-rw-r--r-- 1 root root  292 Jan 10 09:55 10-calico.conflist
+
+# Kubelet uses 00-multus.conf (first alphabetically)
+```
+
+### Check Multus Delegate Configuration
+
+```bash
+# Inside 00-multus.conf
+$ cat /etc/cni/net.d/00-multus.conf | jq .delegates
+
+[
+  {
+    "name": "k8s-pod-network",
+    "plugins": [
+      {
+        "type": "calico",    ← Delegates to Calico
+        ...
+      }
+    ]
+  }
+]
+```
+
+### Check Pod Network Setup
+
+```bash
+# Create pod with annotation
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+  annotations:
+    k8s.v1.cni.cncf.io/networks: macvlan-conf
+spec:
+  containers:
+  - name: test
+    image: alpine
+    command: ["sleep", "3600"]
+EOF
+
+# Check interfaces
+$ kubectl exec test-pod -- ip addr
+2: eth0@if10: ...      ← Created by Calico (via Multus delegate)
+3: net1@if5: ...       ← Created by MacVLAN (via Multus additional)
+```
+
+### Check Multus Logs
+
+```bash
+# On Kubernetes node
+$ journalctl -u kubelet | grep multus
+
+Multus: Adding pod to network k8s-pod-network (delegate)
+Multus: Adding pod to network macvlan-conf (additional)
+```
+
+---
+
+## Summary
+
+### The Key Distinction
+
+| Aspect | Primary CNI (Calico) | Multus |
+|--------|---------------------|--------|
+| **Called by** | Kubelet (via Multus delegate) | Kubelet (directly) |
+| **Purpose** | Create primary interface (eth0) | Orchestrate all networking |
+| **Configuration** | Referenced in Multus delegate | CNI config file (00-multus.conf) |
+| **Relationship** | Peer (via delegation) | **NOT parent/child** |
+| **Always runs?** | Yes (for every pod) | Only if Multus is configured |
+
+### The Correct Mental Model
+
+```
+Multus is NOT a container for other CNIs.
+Multus is a COORDINATOR that:
+  1. Delegates primary networking to another CNI
+  2. Adds additional network interfaces based on annotations
+```
+
+**Calico does NOT run "under" Multus.**
+**Calico runs "via delegation from" Multus.**
+
+This is an important distinction! Multus doesn't "wrap" or "contain" other CNI plugins - it **orchestrates** them through delegation and additional network attachment.
+
+Does this clarify the relationship between Multus and the primary CNI?
+---
 
 ## Glossary
 
