@@ -13,7 +13,7 @@
 10. [Key Takeaways](#key-takeaways)
 11. [SD-Core Specific](#SD-Core's-Network-Interface-Configuration)
 12. [Basics-ChatGPT](#Basics-ChatGPT)
-13. [CNI Plugin Hierarcy(#CNI-Plugin-Hierarchy)
+13. [CNI Plugin Hierarcy](#CNI-Plugin-Hierarchy)
 
 ---
 
