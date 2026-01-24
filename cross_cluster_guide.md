@@ -3826,7 +3826,1289 @@ This separation allows:
 Does this clarify when and how NetworkAttachmentDefinition is used?
 
 ---
+## IPAM Overview
 
+IPAM plugins are responsible for **allocating and managing IP addresses** for network interfaces. They work with CNI plugins (like MacVLAN, bridge, etc.) to assign IPs to pod interfaces.
+
+---
+
+### 1. host-local IPAM
+
+#### What is host-local?
+
+`host-local` is the **simplest and most basic IPAM plugin**. It manages IP addresses **locally on each node** using files stored on the node's filesystem.
+
+#### Key Characteristics
+
+- ✅ **Node-local**: Each node manages its own IP allocations independently
+- ✅ **File-based storage**: Uses files in `/var/lib/cni/networks/` to track allocations
+- ✅ **Simple**: No coordination between nodes
+- ✅ **Fast**: No network calls, just local file operations
+- ❌ **No cross-node awareness**: Different nodes don't know about each other's allocations
+- ❌ **Conflicts possible**: Multiple nodes can allocate the same IP if misconfigured
+
+#### How It Works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Node 1                               │
+│                                                         │
+│  Pod A created with MacVLAN                            │
+│      ↓                                                  │
+│  host-local IPAM called                                │
+│      ↓                                                  │
+│  Reads: /var/lib/cni/networks/macvlan-net/             │
+│      ├── 192.168.100.10  (in use)                      │
+│      ├── 192.168.100.11  (in use)                      │
+│      └── 192.168.100.12  (free)                        │
+│      ↓                                                  │
+│  Allocates: 192.168.100.12                             │
+│      ↓                                                  │
+│  Creates file: /var/lib/cni/networks/macvlan-net/      │
+│                192.168.100.12                          │
+│      ↓                                                  │
+│  Returns IP to MacVLAN plugin                          │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│                    Node 2                               │
+│                                                         │
+│  Pod B created with MacVLAN                            │
+│      ↓                                                  │
+│  host-local IPAM called                                │
+│      ↓                                                  │
+│  Reads: /var/lib/cni/networks/macvlan-net/             │
+│      ├── 192.168.100.13  (in use)                      │
+│      └── 192.168.100.14  (free)                        │
+│      ↓                                                  │
+│  Allocates: 192.168.100.14                             │
+│      ↓                                                  │
+│  Node 2 has NO IDEA what Node 1 allocated!             │
+│  Could allocate 192.168.100.12 if range overlaps ❌    │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Configuration Example
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-hostlocal
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "bridge",
+      "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [{
+            "subnet": "192.168.100.0/24",
+            "rangeStart": "192.168.100.10",
+            "rangeEnd": "192.168.100.100",
+            "gateway": "192.168.100.1"
+          }]
+        ],
+        "routes": [
+          {
+            "dst": "0.0.0.0/0",
+            "gw": "192.168.100.1"
+          }
+        ]
+      }
+    }
+```
+
+#### File-Based Storage
+
+**On each node:**
+```bash
+# IP allocation storage location
+$ ls -la /var/lib/cni/networks/macvlan-hostlocal/
+
+total 16
+drwxr-xr-x 2 root root 4096 Jan 25 10:00 .
+drwxr-xr-x 3 root root 4096 Jan 25 09:50 ..
+-rw-r--r-- 1 root root   73 Jan 25 10:00 192.168.100.10
+-rw-r--r-- 1 root root   73 Jan 25 10:01 192.168.100.11
+-rw-r--r-- 1 root root   73 Jan 25 10:02 192.168.100.12
+-rw-r--r-- 1 root root   48 Jan 25 09:55 last_reserved_ip.0
+```
+
+**File content:**
+```bash
+$ cat /var/lib/cni/networks/macvlan-hostlocal/192.168.100.10
+
+7f8a3b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b
+```
+This is the **container ID** that owns this IP.
+
+**Last reserved IP:**
+```bash
+$ cat /var/lib/cni/networks/macvlan-hostlocal/last_reserved_ip.0
+
+192.168.100.12
+```
+Tracks the last allocated IP to continue from.
+
+### Allocation Algorithm (host-local)
+
+```go
+// Simplified host-local logic
+
+func AllocateIP(subnet, rangeStart, rangeEnd) (IP, error) {
+    // 1. Read last allocated IP from file
+    lastIP := readLastReservedIP()
+    
+    // 2. Try next IP in sequence
+    nextIP := incrementIP(lastIP)
+    
+    // 3. Check if IP is already allocated
+    for nextIP <= rangeEnd {
+        ipFile := filepath.Join(dataDir, nextIP.String())
+        
+        // If file doesn't exist, IP is free
+        if !fileExists(ipFile) {
+            // Allocate it
+            writeFile(ipFile, containerID)
+            writeLastReservedIP(nextIP)
+            return nextIP, nil
+        }
+        
+        // Try next IP
+        nextIP = incrementIP(nextIP)
+    }
+    
+    // No IPs available
+    return nil, errors.New("no IPs available")
+}
+```
+
+#### Deallocation (host-local)
+
+```bash
+# When pod is deleted
+$ rm /var/lib/cni/networks/macvlan-hostlocal/192.168.100.10
+
+# IP is now available for reuse
+```
+
+#### Use Cases for host-local
+
+✅ **Good for:**
+- Single-node clusters
+- Non-overlapping IP ranges across nodes (manual partitioning)
+- Simple test/dev environments
+- Scenarios where you control IP ranges per node
+
+❌ **Bad for:**
+- Multi-node clusters with shared IP pool
+- Dynamic node scaling
+- Cross-cluster scenarios (like Nephio)
+- Any case requiring coordinated IP management
+
+---
+
+### 2. whereabouts IPAM
+
+#### What is whereabouts?
+
+`whereabouts` is a **cluster-aware IPAM plugin** that coordinates IP allocations across all nodes using a shared backend (Kubernetes API or etcd).
+
+#### Key Characteristics
+
+- ✅ **Cluster-wide**: All nodes share the same IP pool
+- ✅ **Coordination**: Prevents duplicate allocations across nodes
+- ✅ **Dynamic**: Automatically handles node additions/removals
+- ✅ **Multiple backends**: Kubernetes API (default) or etcd
+- ✅ **Reconciliation**: Can detect and fix stale allocations
+- ✅ **Overlapping ranges**: Supports same subnet across multiple networks
+- ⚠️ **Slightly slower**: Network API calls vs local file I/O
+- ⚠️ **Requires permissions**: Needs RBAC to access Kubernetes API
+
+#### How It Works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Node 1                               │
+│                                                         │
+│  Pod A created with MacVLAN                            │
+│      ↓                                                  │
+│  whereabouts IPAM called                               │
+│      ↓                                                  │
+│  Queries Kubernetes API:                               │
+│  "What IPs are allocated in this range?"               │
+│      ↓                                                  │
+│      ┌──────────────────────────────────┐             │
+│      │   Kubernetes API Server          │             │
+│      │   (Shared State)                 │             │
+│      │                                   │             │
+│      │   IPPools:                        │             │
+│      │   - 192.168.100.10 (Node 1, Pod A)│             │
+│      │   - 192.168.100.11 (Node 2, Pod B)│             │
+│      │   - 192.168.100.12 (free)         │             │
+│      └──────────────┬───────────────────┘             │
+│                     │                                  │
+│      Allocates: 192.168.100.12                        │
+│      ↓                                                  │
+│  Creates IPPool CRD in Kubernetes                      │
+│      ↓                                                  │
+│  Returns IP to MacVLAN plugin                          │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│                    Node 2                               │
+│                                                         │
+│  Pod B created with MacVLAN                            │
+│      ↓                                                  │
+│  whereabouts IPAM called                               │
+│      ↓                                                  │
+│  Queries Kubernetes API:                               │
+│  "What IPs are allocated?"                             │
+│      ↓                                                  │
+│      ┌──────────────────────────────────┐             │
+│      │   Kubernetes API Server          │             │
+│      │                                   │             │
+│      │   IPPools:                        │             │
+│      │   - 192.168.100.10 (Node 1)      │             │
+│      │   - 192.168.100.11 (Node 2)      │             │
+│      │   - 192.168.100.12 (Node 1)  ← Sees this!      │
+│      │   - 192.168.100.13 (free)         │             │
+│      └──────────────┬───────────────────┘             │
+│                     │                                  │
+│      Allocates: 192.168.100.13                        │
+│      (Skips .12 because Node 1 already has it!)       │
+│                                                         │
+│  ✅ No conflicts!                                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Configuration Example
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-whereabouts
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "bridge",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.100.0/24",
+        "range_start": "192.168.100.10",
+        "range_end": "192.168.100.200",
+        "gateway": "192.168.100.1",
+        "routes": [
+          {
+            "dst": "0.0.0.0/0",
+            "gw": "192.168.100.1"
+          }
+        ],
+        "kubernetes": {
+          "kubeconfig": "/etc/cni/net.d/whereabouts.d/whereabouts.kubeconfig"
+        }
+      }
+    }
+```
+
+#### Kubernetes API Storage (Default)
+
+Whereabouts stores allocations as **Kubernetes Custom Resources**:
+
+```bash
+# Check IP allocations
+$ kubectl get ippools.whereabouts.cni.cncf.io -A
+
+NAMESPACE   NAME                                          AGE
+kube-system macvlan-whereabouts-192-168-100-0-24         5m
+```
+
+```bash
+# Describe the IPPool
+$ kubectl describe ippool macvlan-whereabouts-192-168-100-0-24 -n kube-system
+
+Name:         macvlan-whereabouts-192-168-100-0-24
+Namespace:    kube-system
+Labels:       <none>
+Annotations:  <none>
+API Version:  whereabouts.cni.cncf.io/v1alpha1
+Kind:         IPPool
+Metadata:
+  ...
+Spec:
+  Allocations:
+    192.168.100.10:
+      Container ID: 7f8a3b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a
+      Pod Name:     upf-0
+      Pod Namespace: ran
+      Interface:    net1
+    192.168.100.11:
+      Container ID: 9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c
+      Pod Name:     amf-0
+      Pod Namespace: core
+      Interface:    net1
+    192.168.100.12:
+      Container ID: 1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c
+      Pod Name:     smf-0
+      Pod Namespace: core
+      Interface:    net1
+  Range: 192.168.100.0/24
+  Range Start: 192.168.100.10
+  Range End: 192.168.100.200
+```
+
+### Allocation Algorithm (whereabouts)
+
+```go
+// Simplified whereabouts logic
+
+func AllocateIP(config IPAMConfig) (IP, error) {
+    // 1. Get or create IPPool from Kubernetes API
+    pool := getOrCreateIPPool(config.Range)
+    
+    // 2. Lock the pool (using leader election)
+    lock := acquireLock(pool)
+    defer lock.Release()
+    
+    // 3. Find first available IP
+    for ip := config.RangeStart; ip <= config.RangeEnd; ip++ {
+        if !pool.IsAllocated(ip) {
+            // 4. Mark as allocated
+            pool.Allocations[ip] = AllocationInfo{
+                ContainerID: containerID,
+                PodName:     podName,
+                PodNamespace: podNamespace,
+                Interface:   interfaceName,
+            }
+            
+            // 5. Update IPPool in Kubernetes API
+            updateIPPool(pool)
+            
+            return ip, nil
+        }
+    }
+    
+    return nil, errors.New("no IPs available")
+}
+```
+
+#### Deallocation (whereabouts)
+
+```bash
+# When pod is deleted
+# whereabouts removes entry from IPPool
+
+$ kubectl get ippool macvlan-whereabouts-192-168-100-0-24 -o yaml
+
+spec:
+  allocations:
+    192.168.100.10:  # Still there
+    192.168.100.11:  # Still there
+    # 192.168.100.12 removed when pod deleted
+```
+
+#### Reconciliation Feature
+
+Whereabouts has a **reconciler** that periodically checks for stale allocations:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: whereabouts-reconciler
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: whereabouts
+        image: ghcr.io/k8snetworkplumbingwg/whereabouts:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          /ip-reconciler \
+            --log-level=debug \
+            --interval=30  # Check every 30 seconds
+```
+
+**What reconciler does:**
+1. Lists all IPPools
+2. For each allocated IP, checks if pod still exists
+3. If pod doesn't exist, removes the allocation
+4. Frees up stale IPs from crashed pods, failed deletions, etc.
+
+---
+
+### Comparison: host-local vs whereabouts
+
+#### Feature Comparison
+
+| Feature | host-local | whereabouts |
+|---------|-----------|-------------|
+| **Storage Backend** | Local filesystem | Kubernetes API / etcd |
+| **Scope** | Per-node | Cluster-wide |
+| **Coordination** | ❌ None | ✅ Kubernetes API |
+| **Conflict Prevention** | ❌ Manual (non-overlapping ranges) | ✅ Automatic |
+| **Stale IP Cleanup** | ❌ Manual | ✅ Automatic (reconciler) |
+| **Performance** | ⚡ Very fast (local files) | 🐌 Slightly slower (API calls) |
+| **Complexity** | ✅ Simple | ⚠️ Moderate |
+| **RBAC Required** | ❌ No | ✅ Yes |
+| **Multi-cluster** | ❌ No | ✅ Yes (with shared etcd) |
+| **Scalability** | Limited (per-node) | High (cluster-wide) |
+| **Debugging** | Easy (just check files) | Moderate (check CRDs) |
+
+#### IP Range Management
+
+**host-local: Manual Partitioning Required**
+```
+Node 1: 192.168.100.10 - 192.168.100.50   (manually configured)
+Node 2: 192.168.100.51 - 192.168.100.100  (manually configured)
+Node 3: 192.168.100.101 - 192.168.100.150 (manually configured)
+
+If ranges overlap → IP conflicts! ❌
+```
+
+**whereabouts: Shared Pool**
+```
+All nodes: 192.168.100.10 - 192.168.100.200 (shared pool)
+
+Node 1 pod gets: 192.168.100.10
+Node 2 pod gets: 192.168.100.11
+Node 3 pod gets: 192.168.100.12
+Node 1 pod gets: 192.168.100.13
+
+No conflicts, automatic! ✅
+```
+
+### Performance Characteristics
+
+**host-local:**
+```
+IP Allocation Time: ~1ms
+  - Read local file
+  - Write local file
+  - Done
+```
+
+**whereabouts:**
+```
+IP Allocation Time: ~10-50ms
+  - Query Kubernetes API (network call)
+  - Acquire lock (leader election)
+  - Update IPPool CRD
+  - Wait for API write to complete
+  - Done
+```
+
+For most use cases, this difference is negligible!
+
+---
+
+### Advanced whereabouts Features
+
+#### 1. Multiple Ranges per Network
+
+```yaml
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "ipam": {
+        "type": "whereabouts",
+        "ranges": [
+          {
+            "range": "192.168.100.0/24",
+            "range_start": "192.168.100.10",
+            "range_end": "192.168.100.100"
+          },
+          {
+            "range": "192.168.101.0/24",
+            "range_start": "192.168.101.10",
+            "range_end": "192.168.101.100"
+          }
+        ]
+      }
+    }
+```
+
+Whereabouts will allocate from first available pool.
+
+#### 2. Exclude IPs
+
+```yaml
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.100.0/24",
+        "exclude": [
+          "192.168.100.1/32",    # Gateway
+          "192.168.100.2/32",    # DNS server
+          "192.168.100.50-192.168.100.60"  # Reserved range
+        ]
+      }
+    }
+```
+
+#### 3. IP Reservations
+
+```yaml
+apiVersion: whereabouts.cni.cncf.io/v1alpha1
+kind: OverlappingRangeIPReservation
+metadata:
+  name: amf-n2-reservation
+  namespace: core
+spec:
+  containerid: "amf-0"
+  ifname: "net1"
+  ip: "192.168.100.100"
+  podref: "core/amf-0"
+```
+
+This ensures `192.168.100.100` is always reserved for `amf-0`.
+
+#### 4. Static IP with whereabouts
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [{
+        "name": "macvlan-whereabouts",
+        "ips": ["192.168.100.50/24"]  # Request specific IP
+      }]
+spec:
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+Whereabouts will:
+1. Check if `192.168.100.50` is available
+2. If yes, allocate it
+3. If no, fail (won't allocate different IP)
+
+#### 5. Shared etcd Backend (Multi-Cluster)
+
+```yaml
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.100.0/24",
+        "etcd_endpoints": "https://etcd1:2379,https://etcd2:2379",
+        "etcd_key_file": "/etc/whereabouts/etcd-key.pem",
+        "etcd_cert_file": "/etc/whereabouts/etcd-cert.pem",
+        "etcd_ca_cert_file": "/etc/whereabouts/etcd-ca.pem"
+      }
+    }
+```
+
+**Use case:** Multiple Kubernetes clusters sharing the same IP pool (like Nephio multi-cluster).
+
+---
+
+### Which Should You Use?
+
+#### Use host-local When:
+
+✅ **Single-node cluster**
+```
+Simple dev/test environment with one node
+```
+
+✅ **Manual IP range partitioning**
+```
+You carefully partition ranges per node:
+Node 1: .10-.50
+Node 2: .51-.100
+```
+
+✅ **Maximum performance critical**
+```
+Extremely high pod churn, microseconds matter
+```
+
+✅ **Simplicity is priority**
+```
+Don't want to deal with CRDs, RBAC, etc.
+```
+
+#### Use whereabouts When:
+
+✅ **Multi-node cluster**
+```
+Standard production multi-node setup
+```
+
+✅ **Shared IP pool needed**
+```
+All nodes should allocate from same pool
+```
+
+✅ **Dynamic scaling**
+```
+Nodes added/removed dynamically
+```
+
+✅ **Multi-cluster scenarios**
+```
+Nephio, federated clusters sharing IP space
+```
+
+✅ **Automatic stale IP cleanup**
+```
+Reconciler handles orphaned allocations
+```
+
+✅ **Production telco deployments**
+```
+Reliability and conflict prevention critical
+```
+
+---
+
+### Real-World Example: SD-Core
+
+In SD-Core (as you discovered), they likely use:
+
+#### For N3 Interface (UPF)
+
+**Small deployments:**
+```yaml
+# host-local with manual range per node
+ipam:
+  type: host-local
+  ranges:
+    - subnet: 192.168.252.0/24
+      rangeStart: 192.168.252.10
+      rangeEnd: 192.168.252.20
+```
+
+**Production deployments:**
+```yaml
+# whereabouts for cluster-wide coordination
+ipam:
+  type: whereabouts
+  range: 192.168.252.0/24
+  range_start: 192.168.252.10
+  range_end: 192.168.252.200
+```
+
+---
+
+### Debugging Commands
+
+#### host-local Debugging
+
+```bash
+# Check allocations on current node
+ls -la /var/lib/cni/networks/macvlan-hostlocal/
+
+# Check which container has an IP
+cat /var/lib/cni/networks/macvlan-hostlocal/192.168.100.10
+
+# Manually free an IP (use with caution!)
+rm /var/lib/cni/networks/macvlan-hostlocal/192.168.100.10
+```
+
+#### whereabouts Debugging
+
+```bash
+# Check IP pools
+kubectl get ippools.whereabouts.cni.cncf.io -A
+
+# Detailed allocation info
+kubectl describe ippool <pool-name> -n kube-system
+
+# Check for specific IP
+kubectl get ippool <pool-name> -n kube-system -o yaml | grep "192.168.100.10"
+
+# View reconciler logs
+kubectl logs -n kube-system -l app=whereabouts-reconciler
+
+# Force reconciliation (delete and recreate reconciler pod)
+kubectl delete pod -n kube-system -l app=whereabouts-reconciler
+```
+
+---
+
+### Summary
+
+**host-local:**
+- Simple, fast, file-based
+- Per-node scope
+- Requires manual range management
+- Good for simple/single-node setups
+
+**whereabouts:**
+- Cluster-aware, API-based
+- Cluster-wide scope
+- Automatic coordination and cleanup
+- Good for production/multi-node/multi-cluster setups
+
+For **Nephio and telco deployments**, `whereabouts` is generally the better choice due to its cluster-wide coordination and multi-cluster support via shared etcd.
+
+## The Problem: host-local is Node-Scoped
+
+### What Happens When Pod Reschedules to Different Node
+
+```
+Initial State:
+┌─────────────────────────────────────┐
+│           Node 1                    │
+│                                     │
+│  Pod: upf-0                         │
+│  IP: 192.168.100.50                 │
+│                                     │
+│  /var/lib/cni/networks/macvlan/     │
+│  └── 192.168.100.50                 │
+│      (contains upf-0 container ID)  │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│           Node 2                    │
+│                                     │
+│  /var/lib/cni/networks/macvlan/     │
+│  └── (empty or different IPs)       │
+└─────────────────────────────────────┘
+```
+
+**Node 1 crashes or pod is rescheduled:**
+
+```
+After Rescheduling:
+┌─────────────────────────────────────┐
+│           Node 1 (crashed)          │
+│                                     │
+│  /var/lib/cni/networks/macvlan/     │
+│  └── 192.168.100.50                 │
+│      ⚠️ STALE! Pod no longer here   │
+│      ⚠️ IP locked but unused        │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│           Node 2                    │
+│                                     │
+│  Pod: upf-0 (rescheduled here)      │
+│  IP: ???                            │
+│                                     │
+│  /var/lib/cni/networks/macvlan/     │
+│  └── (Node 2 has NO knowledge       │
+│       of 192.168.100.50!)           │
+│                                     │
+│  host-local allocates NEW IP:       │
+│  IP: 192.168.100.51  ❌ Different!  │
+│                                     │
+│  /var/lib/cni/networks/macvlan/     │
+│  └── 192.168.100.51                 │
+└─────────────────────────────────────┘
+```
+
+---
+
+### Detailed Sequence of Events
+
+#### Scenario 1: Node Failure
+
+**Step 1: Pod running on Node 1**
+```bash
+# On Node 1
+$ ls /var/lib/cni/networks/macvlan-net/
+192.168.100.50  # upf-0 container ID inside
+
+# Pod has interface
+$ kubectl exec upf-0 -- ip addr show net1
+3: net1: inet 192.168.100.50/24
+```
+
+**Step 2: Node 1 becomes unavailable**
+```
+Node 1 status: NotReady
+Kubernetes waits for grace period (default: 5 minutes)
+```
+
+**Step 3: Kubernetes reschedules pod to Node 2**
+```bash
+# Kubernetes scheduler picks Node 2
+# Node 2 has NO knowledge of Node 1's allocations
+
+# On Node 2
+$ ls /var/lib/cni/networks/macvlan-net/
+192.168.100.10  # Some other pod
+192.168.100.11  # Another pod
+# NO record of 192.168.100.50!
+```
+
+**Step 4: host-local IPAM on Node 2 allocates IP**
+```bash
+# host-local reads its LOCAL files only
+# Finds next available IP from ITS perspective
+
+# On Node 2
+$ ls /var/lib/cni/networks/macvlan-net/
+192.168.100.10
+192.168.100.11
+192.168.100.12  # NEW - allocated to upf-0
+```
+
+**Step 5: Pod gets DIFFERENT IP**
+```bash
+$ kubectl exec upf-0 -- ip addr show net1
+3: net1: inet 192.168.100.12/24  ❌ Changed from .50 to .12!
+```
+
+**Step 6: Original IP is LOST**
+```bash
+# On Node 1 (when it recovers)
+$ ls /var/lib/cni/networks/macvlan-net/
+192.168.100.50  # STALE! Container no longer exists
+                # But host-local thinks it's still allocated
+```
+
+---
+
+### Scenario 2: Pod Deletion and Recreation
+
+**Step 1: Delete pod on Node 1**
+```bash
+$ kubectl delete pod upf-0
+
+# host-local receives CNI DEL command
+# Removes allocation file on Node 1
+$ ls /var/lib/cni/networks/macvlan-net/
+# 192.168.100.50 file deleted ✅
+```
+
+**Step 2: Pod recreated, scheduled to Node 2**
+```bash
+# Kubernetes scheduler decides: Node 2
+
+# host-local on Node 2 has NO IDEA about previous allocation
+# It allocates from ITS local pool
+
+$ ls /var/lib/cni/networks/macvlan-net/
+192.168.100.15  # NEW allocation for upf-0
+```
+
+**Result: Different IP again!**
+
+---
+
+### Scenario 3: StatefulSet with Node Affinity
+
+Even with StatefulSet, if the pod moves nodes:
+
+**Initial deployment:**
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: upf
+spec:
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        k8s.v1.cni.cncf.io/networks: macvlan-net
+    spec:
+      # No node affinity - can schedule anywhere
+      containers:
+      - name: upf
+        image: upf:v1
+```
+
+```bash
+# upf-0 scheduled to Node 1
+$ kubectl get pod upf-0 -o wide
+NAME    NODE    IP
+upf-0   node-1  10.244.1.5  # Kubernetes IP (visible)
+
+# MacVLAN IP (not visible in kubectl)
+$ kubectl exec upf-0 -- ip addr show net1
+net1: inet 192.168.100.50/24
+```
+
+**Node 1 goes down:**
+```bash
+# upf-0 rescheduled to Node 2 (no node affinity preventing it)
+
+$ kubectl get pod upf-0 -o wide
+NAME    NODE    IP
+upf-0   node-2  10.244.2.5  # Different K8s IP
+
+$ kubectl exec upf-0 -- ip addr show net1
+net1: inet 192.168.100.22/24  # Different MacVLAN IP! ❌
+```
+
+---
+
+### Why host-local Doesn't Sync
+
+#### Architecture Limitation
+
+```
+┌────────────────────────────────────────────────────────┐
+│              Kubernetes Cluster                        │
+│                                                        │
+│  ┌──────────────────┐      ┌──────────────────┐      │
+│  │     Node 1       │      │     Node 2       │      │
+│  │                  │      │                  │      │
+│  │  host-local      │  ❌  │  host-local      │      │
+│  │  IPAM plugin     │  NO  │  IPAM plugin     │      │
+│  │                  │ COMM │                  │      │
+│  │  Local storage:  │      │  Local storage:  │      │
+│  │  /var/lib/cni/   │      │  /var/lib/cni/   │      │
+│  │  └─ 192.168.     │      │  └─ 192.168.     │      │
+│  │     100.50       │      │     100.15       │      │
+│  └──────────────────┘      └──────────────────┘      │
+│                                                        │
+│  No shared state, no communication!                   │
+└────────────────────────────────────────────────────────┘
+```
+
+**host-local design principles:**
+1. **Stateless**: No daemon, just a binary called by CNI
+2. **Local only**: Only reads/writes local filesystem
+3. **No networking**: Never makes network calls
+4. **No coordination**: Each node is independent
+
+This is by design for **simplicity and speed**, but it means **no cross-node awareness**.
+
+---
+
+### Workarounds for host-local
+
+#### Option 1: Pin Pods to Specific Nodes (Node Affinity)
+
+**Force pod to always run on the same node:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  annotations:
+    k8s.v1.cni.cncf.io/networks: macvlan-net
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: node-1  # Always on node-1
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+**With StatefulSet:**
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: upf
+spec:
+  replicas: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - node-1  # upf-0 always on node-1
+```
+
+**Problem:** Defeats the purpose of Kubernetes scheduling flexibility! Node fails = pod can't run.
+
+#### Option 2: Use Static IP Annotations
+
+**Combine host-local with static IP requests:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [{
+        "name": "macvlan-net",
+        "ips": ["192.168.100.50/24"]  # Request specific IP
+      }]
+spec:
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+**Change IPAM to `static` type:**
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-net
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "master": "eth1",
+      "ipam": {
+        "type": "static"  # Not host-local!
+      }
+    }
+```
+
+**How it works:**
+- Pod carries its own IP in the annotation
+- Doesn't matter which node it runs on
+- `static` IPAM just uses the IP from annotation
+
+**Problem:** 
+- You must manually manage IP assignments
+- Still need to partition ranges to avoid conflicts across nodes
+- Loses dynamic allocation benefits
+
+#### Option 3: Manual IP Range Partitioning
+
+**Assign different ranges to each node:**
+
+```yaml
+# Node 1: NetworkAttachmentDefinition
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-node1
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{
+          "subnet": "192.168.100.0/24",
+          "rangeStart": "192.168.100.10",
+          "rangeEnd": "192.168.100.50"  # Node 1 range
+        }]]
+      }
+    }
+```
+
+```yaml
+# Node 2: NetworkAttachmentDefinition
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-node2
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{
+          "subnet": "192.168.100.0/24",
+          "rangeStart": "192.168.100.51",
+          "rangeEnd": "192.168.100.100"  # Node 2 range
+        }]]
+      }
+    }
+```
+
+**Use node affinity to match:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  annotations:
+    k8s.v1.cni.cncf.io/networks: macvlan-node1  # Use node1's NAD
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: node-1  # Schedule to node-1
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+**Problem:** 
+- Complex management
+- Tight coupling between pods and nodes
+- Defeats Kubernetes scheduling flexibility
+- Still loses IP if pod moves nodes
+
+---
+
+### The Real Solution: Use whereabouts!
+
+This is exactly why `whereabouts` was created:
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-whereabouts
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "master": "eth1",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.100.0/24",
+        "range_start": "192.168.100.10",
+        "range_end": "192.168.100.200"
+      }
+    }
+```
+
+**With whereabouts:**
+
+```
+Pod upf-0 on Node 1:
+  IP: 192.168.100.50
+  Stored in Kubernetes API (cluster-wide)
+
+Node 1 fails:
+  Pod rescheduled to Node 2
+  
+whereabouts on Node 2:
+  - Queries Kubernetes API
+  - Sees 192.168.100.50 was allocated to upf-0
+  - Checks if that allocation is still valid
+  - Container ID matches? Reuse same IP ✅
+  - Or, use IP reservation for guaranteed persistence
+  
+Pod upf-0 on Node 2:
+  IP: 192.168.100.50  ✅ Same IP!
+```
+
+---
+
+### Comparison Table: IP Persistence Across Node Migration
+
+| Scenario | host-local | whereabouts |
+|----------|-----------|-------------|
+| **Pod deleted & recreated on SAME node** | ✅ Same IP (from local file) | ✅ Same IP (from API) |
+| **Pod rescheduled to DIFFERENT node** | ❌ Different IP | ✅ Same IP (with reservation) |
+| **Node failure, pod migrates** | ❌ Different IP | ✅ Same IP (with reservation) |
+| **StatefulSet pod recreation** | ⚠️ Same IP only if on same node | ✅ Same IP regardless of node |
+| **Manual pod migration** | ❌ Different IP | ✅ Same IP (with reservation) |
+| **Cluster autoscaling (node drain)** | ❌ Different IP | ✅ Same IP (with reservation) |
+
+---
+
+### Example: Complete Flow Comparison
+
+#### With host-local (IP LOST)
+
+```bash
+# Day 1: Deploy upf-0 on node-1
+$ kubectl apply -f upf-pod.yaml
+$ kubectl get pod upf-0 -o wide
+NAME    NODE     IP
+upf-0   node-1   10.244.1.5
+
+$ kubectl exec upf-0 -- ip addr show net1
+net1: inet 192.168.100.50/24  # MacVLAN IP
+
+# Day 2: node-1 fails
+$ kubectl get nodes
+NAME     STATUS
+node-1   NotReady  ❌
+node-2   Ready
+
+# Kubernetes reschedules upf-0 to node-2
+$ kubectl get pod upf-0 -o wide
+NAME    NODE     IP
+upf-0   node-2   10.244.2.5
+
+$ kubectl exec upf-0 -- ip addr show net1
+net1: inet 192.168.100.73/24  # DIFFERENT IP! ❌
+
+# External devices (gNB) trying to reach 192.168.100.50
+# Connection fails! ❌
+```
+
+#### With whereabouts + IP Reservation (IP PRESERVED)
+
+```bash
+# Day 0: Create IP reservation
+$ kubectl apply -f - <<EOF
+apiVersion: whereabouts.cni.cncf.io/v1alpha1
+kind: OverlappingRangeIPReservation
+metadata:
+  name: upf-0-n3-ip
+spec:
+  containerid: "upf-0"
+  ip: "192.168.100.50"
+  podref: "ran/upf-0"
+EOF
+
+# Day 1: Deploy upf-0 on node-1
+$ kubectl apply -f upf-pod.yaml
+$ kubectl get pod upf-0 -o wide
+NAME    NODE     IP
+upf-0   node-1   10.244.1.5
+
+$ kubectl exec upf-0 -- ip addr show net1
+net1: inet 192.168.100.50/24  # From reservation ✅
+
+# Day 2: node-1 fails
+$ kubectl get nodes
+NAME     STATUS
+node-1   NotReady  ❌
+node-2   Ready
+
+# Kubernetes reschedules upf-0 to node-2
+$ kubectl get pod upf-0 -o wide
+NAME    NODE     IP
+upf-0   node-2   10.244.2.5  # K8s IP changes
+
+$ kubectl exec upf-0 -- ip addr show net1
+net1: inet 192.168.100.50/24  # SAME IP! ✅
+
+# External devices (gNB) can still reach 192.168.100.50
+# Connection works! ✅
+```
+
+---
+
+### Key Takeaway
+
+**With host-local, when a pod reschedules to a different node:**
+
+❌ **The new node has NO KNOWLEDGE of the previous IP allocation**
+❌ **A new IP will be allocated from the new node's local pool**
+❌ **The old IP remains locked on the old node (until cleaned up)**
+❌ **IP persistence is LOST across node migration**
+
+This is a **fundamental limitation** of `host-local`'s design - it's purely node-local with no cross-node coordination.
+
+**For telco/5G workloads where IP stability is critical**, you must use:
+1. `whereabouts` with IP reservations, OR
+2. `static` IPAM with explicit IP annotations, OR
+3. External IPAM (Infoblox, NetBox), OR
+4. Nephio's declarative IPAM (which generates static annotations automatically)
+
+**Never rely on host-local for IP persistence in multi-node production environments!**
+--
 ## Glossary
 
 **AMF (Access and Mobility Management Function):** 5G core network function handling connection and mobility management
