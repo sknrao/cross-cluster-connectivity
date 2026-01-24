@@ -14,6 +14,7 @@
 11. [SD-Core Specific](#SD-Core's-Network-Interface-Configuration)
 12. [Basics-ChatGPT](#Basics-ChatGPT)
 13. [CNI Plugin Hierarcy](#CNI-Plugin-Hierarchy)
+14. [NADs](#NADs)
 
 ---
 
@@ -2725,11 +2726,11 @@ Step 2: Multus runs (if annotation present) → Creates additional interfaces
 
 ---
 
-## CNI Configuration Files
+### CNI Configuration Files
 
 Let me show you the actual CNI configuration structure on a Kubernetes node:
 
-### Location: `/etc/cni/net.d/`
+#### Location: `/etc/cni/net.d/`
 
 ```bash
 $ ls -la /etc/cni/net.d/
@@ -2739,7 +2740,7 @@ total 24
 -rw-r--r-- 1 root root  156 Jan 10 10:05 macvlan-conf.conf
 ```
 
-### Primary CNI: `10-calico.conflist`
+#### Primary CNI: `10-calico.conflist`
 
 ```json
 {
@@ -2770,7 +2771,7 @@ total 24
 
 **Kubelet reads this and calls Calico directly.**
 
-### Multus Configuration: `00-multus.conf`
+#### Multus Configuration: `00-multus.conf`
 
 ```json
 {
@@ -2809,7 +2810,7 @@ total 24
 
 **Notice:** The `delegates` section contains the **SAME** Calico configuration!
 
-### NetworkAttachmentDefinition: MacVLAN
+#### NetworkAttachmentDefinition: MacVLAN
 
 ```yaml
 apiVersion: k8s.cni.cncf.io/v1
@@ -2834,9 +2835,9 @@ spec:
 
 ---
 
-## How It Actually Works
+### How It Actually Works
 
-### Without Multus (Standard Kubernetes)
+#### Without Multus (Standard Kubernetes)
 
 ```
 ┌─────────────────────────────────────────┐
@@ -2872,7 +2873,7 @@ spec:
       └──────────────────────┘
 ```
 
-### With Multus (Multi-Interface)
+#### With Multus (Multi-Interface)
 
 ```
 ┌─────────────────────────────────────────┐
@@ -2928,9 +2929,9 @@ spec:
 
 ---
 
-## Detailed Call Sequence
+### Detailed Call Sequence
 
-### Step 1: Kubelet Determines Which CNI to Call
+#### Step 1: Kubelet Determines Which CNI to Call
 
 ```bash
 # Kubelet looks in /etc/cni/net.d/
@@ -2941,7 +2942,7 @@ $ ls /etc/cni/net.d/
 10-calico.conflist    ← Would be used if no multus
 ```
 
-### Step 2: Multus is Invoked
+#### Step 2: Multus is Invoked
 
 ```bash
 # Kubelet executes
@@ -2953,7 +2954,7 @@ $ ls /etc/cni/net.d/
 # - Pod name/namespace
 ```
 
-### Step 3: Multus Calls Delegate (Primary CNI)
+#### Step 3: Multus Calls Delegate (Primary CNI)
 
 ```go
 // Inside Multus code (simplified)
@@ -2973,7 +2974,7 @@ result, err := invoke.DelegateAdd(
 // Calico creates eth0 with IP 10.244.1.5
 ```
 
-### Step 4: Multus Checks for Annotations
+#### Step 4: Multus Checks for Annotations
 
 ```go
 // Get pod information
@@ -3004,7 +3005,7 @@ if networksAnnotation != "" {
 }
 ```
 
-### Step 5: All Interfaces Created
+#### Step 5: All Interfaces Created
 
 ```bash
 # Final result inside pod
@@ -3024,7 +3025,7 @@ $ ip addr
 
 ---
 
-## Configuration File Naming Convention
+### Configuration File Naming Convention
 
 The `00-` prefix is crucial:
 
@@ -3047,15 +3048,15 @@ In this case, Multus would never be called!
 
 ---
 
-## Why This Design?
+### Why This Design?
 
-### Multus is a "Meta-Plugin" or "Wrapper"
+#### Multus is a "Meta-Plugin" or "Wrapper"
 
 Multus doesn't manage networks itself - it:
 1. **Delegates** primary network to another CNI (Calico, Flannel, etc.)
 2. **Orchestrates** additional network attachments
 
-### Benefits of This Architecture
+#### Benefits of This Architecture
 
 **1. Backward Compatibility**
 ```
@@ -3083,9 +3084,9 @@ Secondary networks: Workload-specific (N2, N3, storage, etc.)
 
 ---
 
-## Common Misconception vs Reality
+### Common Misconception vs Reality
 
-### ❌ Misconception
+#### ❌ Misconception
 
 ```
 Kubelet
@@ -3099,7 +3100,7 @@ Multus (manages everything)
 "Multus controls all CNI plugins"
 ```
 
-### ✅ Reality
+#### ✅ Reality
 
 ```
 Kubelet
@@ -3120,7 +3121,7 @@ Multus (orchestrator/wrapper)
 
 ## Verification Commands
 
-### Check CNI Configuration Order
+#### Check CNI Configuration Order
 
 ```bash
 # On Kubernetes node
@@ -3131,7 +3132,7 @@ $ ls -la /etc/cni/net.d/
 # Kubelet uses 00-multus.conf (first alphabetically)
 ```
 
-### Check Multus Delegate Configuration
+#### Check Multus Delegate Configuration
 
 ```bash
 # Inside 00-multus.conf
@@ -3150,7 +3151,7 @@ $ cat /etc/cni/net.d/00-multus.conf | jq .delegates
 ]
 ```
 
-### Check Pod Network Setup
+#### Check Pod Network Setup
 
 ```bash
 # Create pod with annotation
@@ -3174,7 +3175,7 @@ $ kubectl exec test-pod -- ip addr
 3: net1@if5: ...       ← Created by MacVLAN (via Multus additional)
 ```
 
-### Check Multus Logs
+#### Check Multus Logs
 
 ```bash
 # On Kubernetes node
@@ -3186,9 +3187,9 @@ Multus: Adding pod to network macvlan-conf (additional)
 
 ---
 
-## Summary
+### Summary
 
-### The Key Distinction
+#### The Key Distinction
 
 | Aspect | Primary CNI (Calico) | Multus |
 |--------|---------------------|--------|
@@ -3198,7 +3199,7 @@ Multus: Adding pod to network macvlan-conf (additional)
 | **Relationship** | Peer (via delegation) | **NOT parent/child** |
 | **Always runs?** | Yes (for every pod) | Only if Multus is configured |
 
-### The Correct Mental Model
+#### The Correct Mental Model
 
 ```
 Multus is NOT a container for other CNIs.
@@ -3213,6 +3214,618 @@ Multus is a COORDINATOR that:
 This is an important distinction! Multus doesn't "wrap" or "contain" other CNI plugins - it **orchestrates** them through delegation and additional network attachment.
 
 Does this clarify the relationship between Multus and the primary CNI?
+---
+
+## NADs
+**NetworkAttachmentDefinition (NAD) is ONLY for secondary interfaces, NOT for the primary interface.**
+
+---
+
+### NetworkAttachmentDefinition Scope
+
+#### Primary Interface (eth0) - NO NAD ❌
+
+The primary interface is configured through:
+1. **CNI configuration file** in `/etc/cni/net.d/`
+2. **Cluster-wide CNI installation** (Calico, Flannel, etc.)
+3. **NOT** through NetworkAttachmentDefinition CRD
+
+```bash
+# Primary CNI configuration
+/etc/cni/net.d/10-calico.conflist
+
+# This is a FILE, not a Kubernetes resource
+# Applied at cluster setup time
+# Affects ALL pods automatically
+```
+
+#### Secondary Interfaces (net1, net2, etc.) - YES NAD ✅
+
+Secondary interfaces are configured through:
+1. **NetworkAttachmentDefinition** CRD (Kubernetes resource)
+2. **Per-pod annotation** referencing the NAD
+3. **Managed by Multus**
+
+```yaml
+# This IS a Kubernetes resource
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-conf
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      ...
+    }
+```
+
+---
+
+### Complete Comparison
+
+#### Primary Interface Configuration
+
+**Method: CNI Config File**
+
+```bash
+# Location: /etc/cni/net.d/10-calico.conflist
+{
+  "name": "k8s-pod-network",
+  "cniVersion": "0.3.1",
+  "plugins": [
+    {
+      "type": "calico",
+      "log_level": "info",
+      "datastore_type": "kubernetes",
+      "ipam": {
+        "type": "calico-ipam"
+      },
+      "policy": {
+        "type": "k8s"
+      }
+    }
+  ]
+}
+```
+
+**Characteristics:**
+- ❌ NOT a Kubernetes resource
+- ❌ NOT visible with `kubectl get`
+- ❌ NOT namespaced
+- ✅ Cluster-wide configuration
+- ✅ Applied to ALL pods automatically
+- ✅ No pod annotation needed
+
+**Pod Creation:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+  # NO annotation needed for primary interface!
+spec:
+  containers:
+  - name: test
+    image: alpine
+```
+
+**Result:**
+```bash
+$ kubectl exec test-pod -- ip addr
+2: eth0@if10: <BROADCAST,MULTICAST,UP>
+    inet 10.244.1.5/24
+    ↑
+    Automatically created by Calico (primary CNI)
+    No NAD required!
+```
+
+---
+
+#### Secondary Interface Configuration
+
+**Method: NetworkAttachmentDefinition**
+
+```yaml
+# This IS a Kubernetes resource (CRD)
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-conf
+  namespace: default  # NADs are namespaced
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "bridge",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.100.0/24"
+      }
+    }
+```
+
+**Characteristics:**
+- ✅ IS a Kubernetes resource (CRD)
+- ✅ Visible with `kubectl get net-attach-def`
+- ✅ Namespaced (belongs to a namespace)
+- ✅ Applied per-pod via annotation
+- ✅ Optional (pods can ignore it)
+- ✅ Managed by Multus
+
+**Pod Creation:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+  annotations:
+    k8s.v1.cni.cncf.io/networks: macvlan-conf  # EXPLICIT reference needed
+spec:
+  containers:
+  - name: test
+    image: alpine
+```
+
+**Result:**
+```bash
+$ kubectl exec test-pod -- ip addr
+2: eth0@if10: <BROADCAST,MULTICAST,UP>
+    inet 10.244.1.5/24
+    ↑ Primary (from CNI config file)
+
+3: net1@if5: <BROADCAST,MULTICAST,UP>
+    inet 192.168.100.100/24
+    ↑ Secondary (from NetworkAttachmentDefinition)
+```
+
+---
+
+### Why This Separation?
+
+#### Design Rationale
+
+**Primary Interface:**
+- Required for Kubernetes to function
+- Must exist on EVERY pod
+- Provides basic connectivity (Services, DNS, etc.)
+- Cluster administrator decides (cluster-wide setting)
+- Can't be different per pod
+
+**Secondary Interfaces:**
+- Optional, workload-specific
+- Only attached when explicitly requested
+- Provide specialized connectivity (telco, storage, etc.)
+- Application developer decides (per-pod annotation)
+- Can be different for each pod
+
+---
+
+### Detailed Architecture
+
+#### Without NetworkAttachmentDefinition
+
+```
+┌────────────────────────────────────────────┐
+│           Kubernetes Cluster               │
+│                                            │
+│  CNI Config: /etc/cni/net.d/              │
+│  ┌────────────────────────────┐           │
+│  │  10-calico.conflist        │           │
+│  │  (cluster-wide)            │           │
+│  └────────────┬───────────────┘           │
+│               │                            │
+│               │ Applied to ALL pods        │
+│               │                            │
+│         ┌─────┴──────┬──────────┐         │
+│         │            │          │         │
+│    ┌────▼───┐   ┌───▼────┐ ┌───▼────┐   │
+│    │Pod A   │   │Pod B   │ │Pod C   │   │
+│    │        │   │        │ │        │   │
+│    │eth0    │   │eth0    │ │eth0    │   │
+│    │10.244  │   │10.244  │ │10.244  │   │
+│    │.1.5    │   │.1.6    │ │.1.7    │   │
+│    └────────┘   └────────┘ └────────┘   │
+│                                            │
+│  All pods get eth0 automatically          │
+│  No NAD, no annotation needed             │
+└────────────────────────────────────────────┘
+```
+
+#### With NetworkAttachmentDefinition
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              Kubernetes Cluster                         │
+│                                                         │
+│  CNI Config: /etc/cni/net.d/                           │
+│  ┌────────────────────────────┐                        │
+│  │  00-multus.conf            │                        │
+│  │  (delegates to calico)     │                        │
+│  └────────────┬───────────────┘                        │
+│               │                                         │
+│               │ ALL pods get eth0                       │
+│               │                                         │
+│         ┌─────┴──────┬──────────┐                      │
+│         │            │          │                      │
+│    ┌────▼───┐   ┌───▼────┐ ┌───▼────┐                │
+│    │Pod A   │   │Pod B   │ │Pod C   │                │
+│    │(no ann)│   │(with   │ │(with   │                │
+│    │        │   │ ann)   │ │ ann)   │                │
+│    │eth0    │   │eth0    │ │eth0    │                │
+│    │10.244  │   │10.244  │ │10.244  │                │
+│    │.1.5    │   │.1.6    │ │.1.7    │                │
+│    └────────┘   │        │ │        │                │
+│                 │net1    │ │net1    │                │
+│                 │192.168 │ │192.168 │                │
+│                 │.100.50 │ │.100.51 │                │
+│                 └───▲────┘ └───▲────┘                │
+│                     │          │                      │
+│  ┌──────────────────┴──────────┴─────────────┐       │
+│  │  NetworkAttachmentDefinition               │       │
+│  │  name: macvlan-conf                        │       │
+│  │  (Kubernetes CRD)                          │       │
+│  │                                             │       │
+│  │  Only pods WITH annotation get net1        │       │
+│  └─────────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Can You Use NAD for Primary Interface?
+
+#### Technically: Yes, but WRONG ❌
+
+There's an advanced (and rarely used) Multus feature that allows defining the primary interface via NAD:
+
+```yaml
+# DON'T DO THIS (unless you have very specific reasons)
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: calico-primary
+  namespace: default
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: "primary"
+spec:
+  config: |
+    {
+      "type": "calico",
+      "ipam": {
+        "type": "calico-ipam"
+      }
+    }
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+  annotations:
+    k8s.v1.cni.cncf.io/networks: '[
+      {"name": "calico-primary", "interface": "eth0", "default-route": ["true"]}
+    ]'
+spec:
+  containers:
+  - name: test
+    image: alpine
+```
+
+**Why this is BAD:**
+
+1. ❌ **Breaks Kubernetes assumptions** - Every pod should have eth0 automatically
+2. ❌ **Violates cluster-wide policy** - Primary CNI should be cluster-wide decision
+3. ❌ **Complicates management** - Each pod needs explicit annotation
+4. ❌ **No isolation** - NADs are namespaced, CNI config is cluster-wide
+5. ❌ **Debugging nightmare** - Why doesn't my pod have eth0?
+6. ❌ **Breaks default behavior** - Pods without annotation won't have network
+
+#### Practically: No, DON'T DO IT ❌
+
+**Standard Practice:**
+- Primary interface: CNI config file (cluster-wide)
+- Secondary interfaces: NetworkAttachmentDefinition (per-pod)
+
+---
+
+### Managing NetworkAttachmentDefinitions
+
+#### Create NAD
+
+```bash
+# Create MacVLAN network definition
+kubectl apply -f - <<EOF
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-n3
+  namespace: ran
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "bridge",
+      "ipam": {
+        "type": "static"
+      }
+    }
+EOF
+```
+
+#### View NADs
+
+```bash
+# List all NetworkAttachmentDefinitions
+$ kubectl get network-attachment-definitions -A
+
+NAMESPACE   NAME          AGE
+ran         macvlan-n3    5m
+core        macvlan-n2    10m
+default     sriov-net     15m
+
+# Short form
+$ kubectl get net-attach-def -A
+```
+
+#### Describe NAD
+
+```bash
+$ kubectl describe net-attach-def macvlan-n3 -n ran
+
+Name:         macvlan-n3
+Namespace:    ran
+Labels:       <none>
+Annotations:  <none>
+API Version:  k8s.cni.cncf.io/v1
+Kind:         NetworkAttachmentDefinition
+Metadata:
+  ...
+Spec:
+  Config:  {
+    "cniVersion": "0.3.1",
+    "type": "macvlan",
+    "master": "eth1",
+    "mode": "bridge",
+    "ipam": {
+      "type": "static"
+    }
+  }
+```
+
+#### Use NAD in Pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  namespace: ran
+  annotations:
+    # Reference NAD by name
+    k8s.v1.cni.cncf.io/networks: macvlan-n3
+spec:
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+---
+
+### Multiple NADs Per Pod
+
+You can attach multiple secondary networks to a pod:
+
+#### Multiple NADs - Simple Syntax
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  annotations:
+    k8s.v1.cni.cncf.io/networks: macvlan-n3, macvlan-n6, sriov-net
+    #                            net1      net2        net3
+spec:
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+**Result:**
+```bash
+$ kubectl exec upf-0 -- ip addr
+2: eth0@if10: ...     # Primary (Calico)
+3: net1@if5: ...      # macvlan-n3
+4: net2@if6: ...      # macvlan-n6
+5: net3@if7: ...      # sriov-net
+```
+
+#### Multiple NADs - Advanced Syntax with IP Assignment
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {
+          "name": "macvlan-n3",
+          "interface": "n3",
+          "ips": ["192.168.100.10/24"]
+        },
+        {
+          "name": "macvlan-n6",
+          "interface": "n6",
+          "ips": ["192.168.200.10/24"]
+        }
+      ]
+spec:
+  containers:
+  - name: upf
+    image: upf:v1
+```
+
+**Result:**
+```bash
+$ kubectl exec upf-0 -- ip addr
+2: eth0@if10: inet 10.244.1.5/24       # Primary
+3: n3@if5: inet 192.168.100.10/24      # macvlan-n3
+4: n6@if6: inet 192.168.200.10/24      # macvlan-n6
+```
+
+---
+
+### Cross-Namespace NAD References
+
+NADs are **namespaced resources**, but you can reference NADs from other namespaces:
+
+#### NAD in Different Namespace
+
+```yaml
+# NAD in 'network-config' namespace
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: shared-macvlan
+  namespace: network-config
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "master": "eth1",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.100.0/24"
+      }
+    }
+```
+
+```yaml
+# Pod in 'ran' namespace referencing NAD from 'network-config' namespace
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gnb-0
+  namespace: ran
+  annotations:
+    k8s.v1.cni.cncf.io/networks: network-config/shared-macvlan
+    #                            namespace/nad-name
+spec:
+  containers:
+  - name: gnb
+    image: gnb:v1
+```
+
+---
+
+### Summary Table
+
+| Aspect | Primary Interface (eth0) | Secondary Interfaces (net1, net2, ...) |
+|--------|-------------------------|---------------------------------------|
+| **Configuration Method** | CNI config file | NetworkAttachmentDefinition CRD |
+| **Location** | `/etc/cni/net.d/` | Kubernetes API (stored in etcd) |
+| **Kubernetes Resource?** | ❌ No (plain file) | ✅ Yes (CRD) |
+| **Visible with kubectl?** | ❌ No | ✅ Yes (`kubectl get net-attach-def`) |
+| **Namespaced?** | ❌ No (cluster-wide) | ✅ Yes |
+| **Applied to Pods** | Automatically (all pods) | Explicitly (via annotation) |
+| **Managed By** | Cluster Admin | Application Developer |
+| **Annotation Required?** | ❌ No | ✅ Yes |
+| **Can be Different Per Pod?** | ❌ No (same for all) | ✅ Yes (per-pod choice) |
+| **Created At** | Cluster setup time | Runtime (like any K8s resource) |
+| **Modified By** | Editing file + restart | `kubectl apply` |
+| **Example** | Calico, Flannel, Cilium | MacVLAN, SRIOV, IPVLAN |
+
+---
+
+### Practical Example: SD-Core
+
+In SD-Core deployment:
+
+#### Primary Interface - NO NAD
+
+```bash
+# On each node: /etc/cni/net.d/10-calico.conflist
+# (or whatever primary CNI you use)
+
+# ALL pods get eth0 automatically
+# Used for:
+# - Kubernetes Services
+# - DNS resolution
+# - Inter-pod communication (within cluster)
+# - Health checks
+```
+
+#### Secondary Interfaces - YES NAD
+
+```yaml
+# NetworkAttachmentDefinition for N3
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: n3-network
+  namespace: core
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "ens18",
+      "mode": "bridge",
+      "ipam": {
+        "type": "static"
+      }
+    }
+```
+
+```yaml
+# UPF pod using the NAD
+apiVersion: v1
+kind: Pod
+metadata:
+  name: upf-0
+  namespace: core
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [{
+        "name": "n3-network",
+        "interface": "access",
+        "ips": ["192.168.252.3/24"]
+      }]
+spec:
+  containers:
+  - name: upf
+    image: upf:latest
+```
+
+**Result:**
+- `eth0`: Primary Kubernetes network (Calico) - automatic
+- `access`: N3 interface (MacVLAN) - via NAD
+
+---
+
+### Key Takeaway
+
+**NetworkAttachmentDefinition is ONLY for secondary interfaces.**
+
+- ✅ **Primary interface (eth0)**: CNI config file (cluster-wide)
+- ✅ **Secondary interfaces (net1, net2, ...)**: NetworkAttachmentDefinition (per-pod)
+
+This separation allows:
+- Cluster admins to control primary networking (stability, security)
+- Application developers to add specialized networks as needed (flexibility)
+
+**Never use NAD for primary interface unless you have an extremely specific use case and fully understand the implications!**
+
+Does this clarify when and how NetworkAttachmentDefinition is used?
+
 ---
 
 ## Glossary
