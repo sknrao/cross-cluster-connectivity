@@ -17,6 +17,7 @@
 14. [NADs](#NADs)
 15. [IPAM Overview](#ipam-overview)
 16. [Host-Local is Node-Scoped](#host-local-is-node-scoped)
+17. [Nephio Whereabouts](#nephio-whereabouts)
 
 ---
 
@@ -5112,6 +5113,526 @@ This is a **fundamental limitation** of `host-local`'s design - it's purely node
 **Never rely on host-local for IP persistence in multi-node production environments!**
 
 --
+
+## Nephio Whereabouts
+
+### Whereabouts Storage Options
+
+First, let's understand that `whereabouts` supports **two storage backends**:
+
+#### Option 1: Kubernetes API (Default)
+- Stores IP allocations as **IPPool CRDs** in the Kubernetes cluster
+- Each workload cluster has its own Kubernetes API server
+- No external etcd needed
+
+#### Option 2: External etcd (For Multi-Cluster)
+- Stores IP allocations in a **shared external etcd cluster**
+- Multiple Kubernetes clusters can share the same etcd
+- Requires external infrastructure
+
+---
+
+### Nephio's Approach: Per-Cluster Storage
+
+**Important:** In Nephio, whereabouts storage is **NOT centralized** in the management cluster!
+
+#### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│           Nephio Management Cluster                      │
+│                                                          │
+│  ┌────────────────────────────────────────┐             │
+│  │  IPAM Controller                       │             │
+│  │                                        │             │
+│  │  - Allocates IP ranges                │             │
+│  │  - Creates IPAllocation CRDs          │             │
+│  │  - Generates static IP annotations    │             │
+│  │  - Writes to Git                      │             │
+│  │                                        │             │
+│  │  Storage: Just the allocation PLAN    │             │
+│  │  (not runtime allocations)            │             │
+│  └────────────────────────────────────────┘             │
+│                                                          │
+│  ┌────────────────────────────────────────┐             │
+│  │  Git Repositories                      │             │
+│  │                                        │             │
+│  │  Stores:                               │             │
+│  │  - IPAllocation resources              │             │
+│  │  - Static IP annotations               │             │
+│  │  - NetworkAttachmentDefinitions        │             │
+│  └────────────────┬───────────────────────┘             │
+└───────────────────┼──────────────────────────────────────┘
+                    │
+                    │ ConfigSync pulls
+                    │
+        ┌───────────┴────────────┐
+        │                        │
+┌───────▼────────┐      ┌────────▼───────┐
+│  my-ran        │      │  my-core       │
+│  Cluster       │      │  Cluster       │
+│                │      │                │
+│ ┌────────────┐ │      │ ┌────────────┐ │
+│ │whereabouts │ │      │ │whereabouts │ │
+│ │            │ │      │ │            │ │
+│ │Storage:    │ │      │ │Storage:    │ │
+│ │K8s API     │ │      │ │K8s API     │ │
+│ │(local)     │ │      │ │(local)     │ │
+│ └────────────┘ │      │ └────────────┘ │
+│                │      │                │
+│ IPPools stored │      │ IPPools stored │
+│ in THIS        │      │ in THIS        │
+│ cluster's API  │      │ cluster's API  │
+└────────────────┘      └────────────────┘
+```
+
+#### Key Points
+
+**1. Nephio Management Cluster:**
+- ❌ Does NOT store runtime IP allocations
+- ✅ Stores IP allocation PLAN (which IP ranges go to which cluster)
+- ✅ Generates static IP configurations
+- ✅ Ensures no conflicts at planning time
+
+**2. Workload Clusters (my-ran, my-core):**
+- ✅ Each has its own whereabouts IPAM
+- ✅ Each stores its own IPPools in its own Kubernetes API
+- ✅ Whereabouts runs independently in each cluster
+- ❌ No shared etcd between clusters
+
+---
+
+### How Nephio Prevents Conflicts WITHOUT Shared Storage
+
+This is the clever part! Nephio prevents IP conflicts **at the planning stage**, not at the runtime allocation stage.
+
+#### Nephio's Two-Phase Approach
+
+##### Phase 1: Planning (Management Cluster)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│        Nephio Management Cluster - IPAM Controller       │
+│                                                          │
+│  IPClaim from my-ran cluster:                           │
+│    Network: n2                                          │
+│    Subnet: 192.168.100.0/24                            │
+│                                                          │
+│  IPClaim from my-core cluster:                          │
+│    Network: n2                                          │
+│    Subnet: 192.168.100.0/24                            │
+│                                                          │
+│  IPAM Controller analyzes:                              │
+│  - Both clusters want same subnet                       │
+│  - Need to partition the space                          │
+│                                                          │
+│  IPAM Controller allocates:                             │
+│  ┌─────────────────────────────────────────────┐       │
+│  │ my-ran cluster:                             │       │
+│  │   Range: 192.168.100.10 - 192.168.100.99   │       │
+│  │                                             │       │
+│  │ IPAllocation created:                       │       │
+│  │   prefix: 192.168.100.10/28                │       │
+│  │   Static IP: 192.168.100.50 for upf-0      │       │
+│  └─────────────────────────────────────────────┘       │
+│                                                          │
+│  ┌─────────────────────────────────────────────┐       │
+│  │ my-core cluster:                            │       │
+│  │   Range: 192.168.100.100 - 192.168.100.199 │       │
+│  │                                             │       │
+│  │ IPAllocation created:                       │       │
+│  │   prefix: 192.168.100.100/28               │       │
+│  │   Static IP: 192.168.100.100 for amf-0     │       │
+│  └─────────────────────────────────────────────┘       │
+│                                                          │
+│  Conflict prevention: DONE at planning time! ✅         │
+└──────────────────────────────────────────────────────────┘
+```
+
+##### Phase 2: Runtime (Workload Clusters)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                my-ran Cluster                            │
+│                                                          │
+│  ConfigSync pulls from Git:                             │
+│  ┌────────────────────────────────────────────┐         │
+│  │ NetworkAttachmentDefinition                │         │
+│  │   ipam:                                    │         │
+│  │     type: whereabouts                      │         │
+│  │     range: 192.168.100.0/24               │         │
+│  │     range_start: 192.168.100.10           │         │
+│  │     range_end: 192.168.100.99  ← LIMITED! │         │
+│  └────────────────────────────────────────────┘         │
+│                                                          │
+│  Pod upf-0 created with annotation:                     │
+│  ┌────────────────────────────────────────────┐         │
+│  │ annotations:                               │         │
+│  │   k8s.v1.cni.cncf.io/networks: |          │         │
+│  │     [{                                     │         │
+│  │       "name": "n2-network",               │         │
+│  │       "ips": ["192.168.100.50/24"]  ← Static! │     │
+│  │     }]                                     │         │
+│  └────────────────────────────────────────────┘         │
+│                                                          │
+│  whereabouts on my-ran:                                 │
+│  - Sees static IP request: 192.168.100.50              │
+│  - Checks if it's in allowed range (.10-.99) ✅         │
+│  - Allocates it                                         │
+│  - Stores in LOCAL Kubernetes API                       │
+│                                                          │
+│  ┌────────────────────────────────────────────┐         │
+│  │ IPPool (stored in my-ran K8s API)         │         │
+│  │   192.168.100.50: upf-0                   │         │
+│  │   192.168.100.51: cu-0                    │         │
+│  └────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│                my-core Cluster                           │
+│                                                          │
+│  ConfigSync pulls from Git:                             │
+│  ┌────────────────────────────────────────────┐         │
+│  │ NetworkAttachmentDefinition                │         │
+│  │   ipam:                                    │         │
+│  │     type: whereabouts                      │         │
+│  │     range: 192.168.100.0/24               │         │
+│  │     range_start: 192.168.100.100          │         │
+│  │     range_end: 192.168.100.199  ← Different! │      │
+│  └────────────────────────────────────────────┘         │
+│                                                          │
+│  Pod amf-0 created with annotation:                     │
+│  ┌────────────────────────────────────────────┐         │
+│  │ annotations:                               │         │
+│  │   k8s.v1.cni.cncf.io/networks: |          │         │
+│  │     [{                                     │         │
+│  │       "name": "n2-network",               │         │
+│  │       "ips": ["192.168.100.100/24"]  ← Static! │    │
+│  │     }]                                     │         │
+│  └────────────────────────────────────────────┘         │
+│                                                          │
+│  whereabouts on my-core:                                │
+│  - Sees static IP request: 192.168.100.100             │
+│  - Checks if it's in allowed range (.100-.199) ✅       │
+│  - Allocates it                                         │
+│  - Stores in LOCAL Kubernetes API                       │
+│                                                          │
+│  ┌────────────────────────────────────────────┐         │
+│  │ IPPool (stored in my-core K8s API)        │         │
+│  │   192.168.100.100: amf-0                  │         │
+│  │   192.168.100.101: smf-0                  │         │
+│  └────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────┘
+```
+
+
+### Nephio's Conflict Prevention Strategy
+
+#### Strategy: Range Partitioning + Static IPs
+
+```
+Nephio doesn't need shared runtime storage because:
+
+1. ✅ Allocates non-overlapping ranges to each cluster
+   - my-ran: .10-.99
+   - my-core: .100-.199
+
+2. ✅ Generates static IP annotations
+   - upf-0: 192.168.100.50 (always)
+   - amf-0: 192.168.100.100 (always)
+
+3. ✅ Each cluster's whereabouts enforces its range
+   - my-ran whereabouts can't allocate .100+
+   - my-core whereabouts can't allocate .10-.99
+
+4. ✅ Conflicts impossible by design!
+```
+
+---
+
+### What Each Component Stores
+
+#### Nephio Management Cluster Storage
+
+```yaml
+# Stored in management cluster's Kubernetes API (via Porch/Git)
+
+# IP allocation PLAN
+apiVersion: ipam.nephio.org/v1alpha1
+kind: NetworkInstance
+metadata:
+  name: n2-network
+spec:
+  prefixes:
+  - prefix: 192.168.100.0/24
+    allocations:
+    - cluster: my-ran
+      prefix: 192.168.100.10/28
+    - cluster: my-core
+      prefix: 192.168.100.100/28
+
+# Specific allocations
+apiVersion: ipam.nephio.org/v1alpha1
+kind: IPAllocation
+metadata:
+  name: upf-0-n3
+  namespace: ran-upf
+spec:
+  cluster: my-ran
+  prefix: 192.168.100.50/32
+  gateway: 192.168.100.1
+
+apiVersion: ipam.nephio.org/v1alpha1
+kind: IPAllocation
+metadata:
+  name: amf-0-n2
+  namespace: core-amf
+spec:
+  cluster: my-core
+  prefix: 192.168.100.100/32
+  gateway: 192.168.100.1
+```
+
+**This is the PLAN, not runtime state!**
+
+#### my-ran Cluster Storage
+
+```yaml
+# Stored in my-ran's Kubernetes API (by whereabouts)
+
+apiVersion: whereabouts.cni.cncf.io/v1alpha1
+kind: IPPool
+metadata:
+  name: n2-network-192-168-100-0-24
+  namespace: kube-system
+spec:
+  range: 192.168.100.0/24
+  range_start: 192.168.100.10   # From Nephio's plan
+  range_end: 192.168.100.99     # From Nephio's plan
+  allocations:
+    192.168.100.50:  # Runtime allocation
+      containerID: 7f8a3b2c...
+      podName: upf-0
+      podNamespace: ran-upf
+    192.168.100.51:  # Runtime allocation
+      containerID: 9b0c1d2e...
+      podName: cu-0
+      podNamespace: ran-cu
+```
+
+**This is RUNTIME state, local to my-ran!**
+
+#### my-core Cluster Storage
+
+```yaml
+# Stored in my-core's Kubernetes API (by whereabouts)
+
+apiVersion: whereabouts.cni.cncf.io/v1alpha1
+kind: IPPool
+metadata:
+  name: n2-network-192-168-100-0-24
+  namespace: kube-system
+spec:
+  range: 192.168.100.0/24
+  range_start: 192.168.100.100  # Different from my-ran!
+  range_end: 192.168.100.199    # Different from my-ran!
+  allocations:
+    192.168.100.100:  # Runtime allocation
+      containerID: 1b2c3d4e...
+      podName: amf-0
+      podNamespace: core-amf
+    192.168.100.101:  # Runtime allocation
+      containerID: 3d4e5f6a...
+      podName: smf-0
+      podNamespace: core-smf
+```
+
+**This is RUNTIME state, local to my-core!**
+
+---
+
+### Why This Works Without Shared Storage
+
+#### The Key Insight
+
+```
+Nephio separates concerns:
+
+Planning Time (Management Cluster):
+  - "upf-0 gets 192.168.100.50"
+  - "amf-0 gets 192.168.100.100"
+  - Stored in Git as static IP annotations
+  - Conflicts prevented here ✅
+
+Runtime (Workload Clusters):
+  - whereabouts just enforces the plan
+  - Sees static IP request
+  - Verifies it's in allowed range
+  - Allocates it
+  - No cross-cluster coordination needed ✅
+```
+
+#### Analogy
+
+Think of it like reserved parking spaces:
+
+```
+Nephio (Management):
+  "Space #50 is for upf-0's car"
+  "Space #100 is for amf-0's car"
+  Writes this on the parking signs
+
+my-ran (Parking Lot Attendant):
+  upf-0's car arrives
+  Driver says: "I'm upf-0, I want space #50"
+  Attendant checks: "Space #50 is in my lot (spaces 10-99)? Yes ✅"
+  Attendant checks: "Is space #50 available? Yes ✅"
+  "Here's your space #50"
+
+my-core (Different Parking Lot Attendant):
+  amf-0's car arrives
+  Driver says: "I'm amf-0, I want space #100"
+  Attendant checks: "Space #100 is in my lot (spaces 100-199)? Yes ✅"
+  Attendant checks: "Is space #100 available? Yes ✅"
+  "Here's your space #100"
+
+No need for attendants to talk to each other!
+Each manages their own section.
+```
+
+---
+
+### What If You WANTED Shared etcd?
+
+You could configure whereabouts with shared etcd for additional coordination, but **Nephio doesn't require it** because of the static IP approach.
+
+#### Hypothetical Shared etcd Setup
+
+```yaml
+# In BOTH clusters: my-ran and my-core
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: n2-network
+spec:
+  config: |
+    {
+      "type": "macvlan",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.100.0/24",
+        "etcd_endpoints": "https://shared-etcd.nephio.svc:2379",
+        "etcd_cert_file": "/etc/whereabouts/etcd-cert.pem",
+        "etcd_key_file": "/etc/whereabouts/etcd-key.pem",
+        "etcd_ca_cert_file": "/etc/whereabouts/etcd-ca.pem"
+      }
+    }
+```
+
+**Where would this etcd run?**
+
+Option 1: On management cluster
+```
+┌──────────────────────────────────┐
+│  Nephio Management Cluster       │
+│                                  │
+│  ┌────────────────────┐          │
+│  │  etcd cluster      │          │
+│  │  (shared storage)  │          │
+│  └────────┬───────────┘          │
+└───────────┼──────────────────────┘
+            │
+            │ Both clusters access
+            │
+    ┌───────┴────────┐
+    │                │
+┌───▼────┐      ┌────▼───┐
+│ my-ran │      │my-core │
+└────────┘      └────────┘
+```
+
+Option 2: External infrastructure
+```
+    ┌────────────────────┐
+    │ External etcd      │
+    │ (separate infra)   │
+    └───────┬────────────┘
+            │
+    ┌───────┴────────┐
+    │                │
+┌───▼────┐      ┌────▼───┐
+│ my-ran │      │my-core │
+└────────┘      └────────┘
+```
+
+**But Nephio doesn't do this because:**
+- ❌ Adds complexity
+- ❌ Creates dependency on external infrastructure
+- ❌ Single point of failure
+- ❌ Not needed with static IP approach
+
+---
+
+### Verification Commands
+
+#### Check Planning State (Management Cluster)
+
+```bash
+# On Nephio management cluster
+kubectl get networkin stances -A
+kubectl get ipallocations -A
+
+# View allocation plan
+kubectl get ipallocation upf-0-n3 -o yaml
+```
+
+#### Check Runtime State (Workload Clusters)
+
+```bash
+# On my-ran cluster
+kubectl get ippools.whereabouts.cni.cncf.io -A
+
+kubectl describe ippool n2-network-192-168-100-0-24 -n kube-system
+# Shows: range_start: 192.168.100.10
+#        range_end: 192.168.100.99
+
+# On my-core cluster
+kubectl get ippools.whereabouts.cni.cncf.io -A
+
+kubectl describe ippool n2-network-192-168-100-0-24 -n kube-system
+# Shows: range_start: 192.168.100.100
+#        range_end: 192.168.100.199
+```
+
+**Notice: Different ranges! Each cluster stores its own runtime state.**
+
+---
+
+### Summary
+
+#### Who Maintains Storage in Nephio?
+
+| Storage Type | What's Stored | Where | Maintained By |
+|--------------|---------------|-------|---------------|
+| **Planning State** | IP allocation plan, IPAllocation CRDs, range assignments | Nephio management cluster (Git + Kubernetes API) | Nephio IPAM Controller |
+| **Runtime State (my-ran)** | Actual pod IP allocations in my-ran | my-ran Kubernetes API (IPPool CRDs) | whereabouts in my-ran cluster |
+| **Runtime State (my-core)** | Actual pod IP allocations in my-core | my-core Kubernetes API (IPPool CRDs) | whereabouts in my-core cluster |
+
+#### Key Architecture Principles
+
+1. ✅ **No shared etcd required** - Each cluster has independent whereabouts
+2. ✅ **No runtime coordination** - Conflicts prevented at planning time
+3. ✅ **Decentralized runtime** - Each cluster manages its own IP state
+4. ✅ **Centralized planning** - Nephio ensures no conflicts in allocation plan
+5. ✅ **Static IPs** - Plan encoded as static IP annotations
+
+**The management cluster stores the PLAN (what should be), each workload cluster stores the REALITY (what is).**
+
+This is a key design principle of Nephio: **planning is centralized, execution is decentralized**.
+
+
+---
+
 ## Glossary
 
 **AMF (Access and Mobility Management Function):** 5G core network function handling connection and mobility management
