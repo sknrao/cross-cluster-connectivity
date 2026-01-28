@@ -4565,6 +4565,8 @@ kubectl delete pod -n kube-system -l app=whereabouts-reconciler
 
 For **Nephio and telco deployments**, `whereabouts` is generally the better choice due to its cluster-wide coordination and multi-cluster support via shared etcd.
 
+---
+
 ## The Problem: host-local is Node-Scoped
 
 ### What Happens When Pod Reschedules to Different Node
@@ -4955,7 +4957,7 @@ spec:
 
 ---
 
-### The Real Solution: Use whereabouts!
+#### The Real Solution: Use whereabouts!
 
 This is exactly why `whereabouts` was created:
 
@@ -5088,8 +5090,6 @@ net1: inet 192.168.100.50/24  # SAME IP! ✅
 # Connection works! ✅
 ```
 
----
-
 ### Key Takeaway
 
 **With host-local, when a pod reschedules to a different node:**
@@ -5108,6 +5108,7 @@ This is a **fundamental limitation** of `host-local`'s design - it's purely node
 4. Nephio's declarative IPAM (which generates static annotations automatically)
 
 **Never rely on host-local for IP persistence in multi-node production environments!**
+
 --
 ## Glossary
 
