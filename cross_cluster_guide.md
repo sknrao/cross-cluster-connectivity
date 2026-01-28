@@ -15,6 +15,8 @@
 12. [Basics-ChatGPT](#Basics-ChatGPT)
 13. [CNI Plugin Hierarcy](#CNI-Plugin-Hierarchy)
 14. [NADs](#NADs)
+15. [IPAM Overview](#ipam-overview)
+16. [Host-Local is Node-Scoped](#host-local-is-node-scoped)
 
 ---
 
@@ -4567,7 +4569,7 @@ For **Nephio and telco deployments**, `whereabouts` is generally the better choi
 
 ---
 
-## The Problem: host-local is Node-Scoped
+## host-local is Node-Scoped
 
 ### What Happens When Pod Reschedules to Different Node
 
